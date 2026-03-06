@@ -1,0 +1,1536 @@
+---
+title: "Cognition Paper"
+author: "Austin Russell"
+date: "2025-10-29"
+output: html_document
+---
+
+#getting the raw data into R
+```{r}
+library(dada2) #call on dada2 package
+library(tidyverse) # call on package for data manipulating
+library(phyloseq) #package required for decontamination, also good for many analyses
+library(decontam) #'decontam
+
+setwd("~/Desktop/Aim 1+2/aims_1_2_seq") #set working directory
+
+
+path <- "fastq-primers-trimmed" #setting the relative path to the trimmed fastq files
+fns <- list.files(path, pattern=".fastq", full.names=TRUE) #defining the file names
+head(fns) #checking that I properly navigated to the correct path
+
+#now define the forward and reverse files
+fnFs <- list.files(path, pattern="_R1_001.fastq", full.names=TRUE)
+fnRs <- list.files(path, pattern="_R2_001.fastq", full.names=TRUE)
+head(fnFs)
+
+q_plot_F<-plotQualityProfile(fnFs[1:2]) #plot quality of forward reads, choosing first two samples and negatives
+
+pdf(paste("/Users/russ/Desktop/q_plot_F.pdf"), width = 10, height = 10)
+print(q_plot_F)
+dev.off()
+
+q_plot_R <- plotQualityProfile(fnRs[1:2]) #plot quality of reverse reads, choosing first two samples and negatives
+
+pdf(paste("/Users/russ/Desktop/q_plot_R.pdf"), width = 6, height = 4)
+print(q_plot_R)
+dev.off()
+
+#dereplication
+
+#filtering with default paramaters and truncating to length based on quality profiles
+filtFs <- file.path(path, "filtered", basename(fnFs)) #directory for filtered forward reads
+filtRs <- file.path(path, "filtered", basename(fnRs)) #directory for filtered reverse reads
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(275, 225)) #fix truncLen based on quality score stuff
+
+#denoising and removing chimeras
+errF <- learnErrors(filtFs, multi=TRUE)
+errR <- learnErrors(filtRs, multi=TRUE)
+
+#plotting error models
+e_plot_F<-plotErrors(errF, nominalQ=TRUE)
+e_plot_R<-plotErrors(errR, nominalQ=TRUE)
+
+pdf(paste("/Users/russ/Desktop/e_plot_F.pdf"), width = 6, height = 4)
+print(e_plot_F)
+dev.off()
+
+pdf(paste("/Users/russ/Desktop/e_plot_R.pdf"), width = 6, height = 4)
+print(e_plot_R)
+dev.off()
+
+#DADA 
+ddF <- dada(filtFs, errF, pool="pseudo", multi=TRUE) #note the pseudopooling option and the detection of singletons is enabled
+ddR <- dada(filtRs, errR, pool="pseudo", multi=TRUE)
+
+merged <- mergePairs(ddF, filtFs, ddR, filtRs, verbose=TRUE, justConcatenate = FALSE) #concatenate (meshes reads together).  False bc i don't want concatenated. merge them bc there is overlap only not merge with miniseq bc no overlap
+
+#construct the table
+table.chimeras <- makeSequenceTable(merged)
+dim(table.chimeras)
+
+#remove chimeras
+table.no.chimeras <- removeBimeraDenovo(table.chimeras, multi=TRUE, verbose=TRUE)
+sum(table.no.chimeras)/sum(table.chimeras)
+
+#export this table as a text file
+write.table(t(table.no.chimeras), file = 'table.tsv', sep = "\t", row.names = TRUE, col.names=NA, quote=FALSE)
+
+#at this point I'd also like to export the sequences
+uniquesToFasta(table.no.chimeras, fout='rep-seqs.fasta', ids = colnames(table.no.chimeras))
+
+#check the pipeline (from primer removal and beyond)
+getN <- function(x) sum(getUniques(x))
+
+
+summary_tab <- data.frame(row.names=fnFs, dada2_input=out[,1],
+                          filtered=out[,2], ddF=sapply(ddF, getN),
+                          ddR=sapply(ddR, getN), merged=sapply(merged, getN),
+                          table.no.chimeras=rowSums(table.no.chimeras),
+                          final_perc_reads_retained=round(rowSums(table.no.chimeras)/out[,1]*100, 1))
+
+
+summary_tab
+
+
+track <- cbind(out, sapply(ddF, getN), sapply(ddR, getN), sapply(merged, getN), rowSums(table.no.chimeras))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- basename(fnFs)
+head(track)
+write.csv(track, "pipeline_stats.csv")
+
+#CLASSIFYING TO ASSIGN TAXONOMY
+system.time(tax <- assignTaxonomy(table.no.chimeras, "silva_nr99_v138.1_train_set.fa.gz", 
+                                  multi=TRUE))
+unname(head(tax))
+
+write.table(tax, file = 'taxonomy.tsv', sep = "\t", row.names = TRUE, col.names=NA, quote=FALSE)
+
+#DECONTAMINATING
+#The method I am going to use removes sequences that occur more often in negative controls than they do in real samples.
+
+library(readxl)
+#reading in the metadata and creating a phyloseq object
+metadata <- read_xlsx("/Users/russ/Desktop/Aim 1+2/aims 1+2 seq data/metadata.xlsx") #importing the metadata
+#remove NAs from sequencing facility (positive samples that don't matter, and rename rows)
+metadata <- metadata[!is.na(metadata$seq_file), ]
+row.names(metadata) <- metadata$seq_file #altering its format so row names are the sample ids
+
+
+#creating a 'phyloseq' object
+trans_table.no.chimeras<-t(table.no.chimeras)
+otu<-otu_table(trans_table.no.chimeras, taxa_are_rows = TRUE)
+otu<-t(otu)
+samp<-sample_data(metadata)
+row.names(samp) <- samp$seq_file #altering its format so row names are the sample ids
+tax_tab<-tax_table(tax)
+#phyloseq is essentially a useful bunch of functions for making plots and conducting analyses with this sort of data
+ps <- phyloseq(otu, samp, tax_tab) #making the phyloseq object
+
+library(tidyverse) ; packageVersion("tidyverse") # 1.3.1
+library(phyloseq) ; packageVersion("phyloseq") # 1.22.3
+library(vegan) ; packageVersion("vegan") # 2.5.4
+library(viridis) ; packageVersion("viridis") # 0.5.1
+library(decontam)
+
+seqtab <- makeSequenceTable(merged)
+seqtab.nochim <- removeBimeraDenovo(seqtab, verbose=T) # Identified 1331 bimeras out of 5895 input sequences.
+
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+# making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "ASVs.fa")
+
+# count table:
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+asv_tab<-table.no.chimeras
+asv_headers<-paste("ASV_",1:ncol(asv_tab))
+asv_seqs<-colnames(asv_tab)
+colnames(asv_tab)<-asv_headers
+
+library(DECIPHER)
+download.file(url="http://www2.decipher.codes/Classification/TrainingSets/SILVA_SSU_r138_2019.RData", destfile="SILVA_SSU_r138_2019.RData")
+
+## loading reference taxonomy object
+load("SILVA_SSU_r138_2019.RData")
+
+## loading DECIPHER
+library(DECIPHER)
+library(dada2)
+
+## creating DNAStringSet object of our ASVs
+dna <- DNAStringSet(getSequences(seqtab.nochim))
+
+## and classifying
+tax_info <- IdTaxa(test=dna, trainingSet=trainingSet, strand="both", processors=NULL)
+
+# tax table:
+# creating table of taxonomy and setting any that are unclassified as "NA"
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species")
+asv_tax <- t(sapply(tax_info, function(x) {
+  m <- match(ranks, x$rank)
+  taxa <- x$taxon[m]
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+}))
+colnames(asv_tax) <- ranks
+rownames(asv_tax) <- gsub(pattern=">", replacement="", x=asv_headers)
+
+write.table(asv_tax, "ASVs_taxonomy.tsv", sep = "\t", quote=F, col.names=NA)
+
+colnames(asv_tab) 
+
+contamdf.prev <- isContaminant(ps, method="prevalence", neg="negative")
+table(contamdf.prev$contaminant)
+
+#contam_df <- isContaminant(t(asv_tab), neg=metadata$negative) 
+
+table(contamdf.prev$contaminant)
+contam_asvs <- row.names(contamdf.prev[contamdf.prev$contaminant == TRUE, ])
+
+tax[row.names(asv_tab) %in% contam_asvs, ]
+
+asv_tab_no_contam <- asv_tab[!row.names(asv_tab) %in% contam_asvs, ]
+asv_tax_no_contam <- tax[(!row.names(tax) %in% contam_asvs), ]
+
+
+#asv_tab_no_contam<-asv_tab[asv_tab["primers-trimmed-GMCF-1240-Negative_S169_L001_R1_001.fastq",]==0,]
+#asv_tax_no_contam<-asv_tax_no_contam[row.names(asv_tab_no_contam),]
+
+
+asv_seq_headers_bind<-cbind(asv_seqs,row.names(asv_headers))
+colnames(blorp)[7]<-"SEQ"
+rownames(blorp)<-colnames(asv_tab)
+asv_tax<-blorp
+
+
+write(asv_fasta, "ASVs-no-contam.fa")
+write.table(asv_tab_no_contam, "ASVs_counts-no-contam.tsv",
+            sep="\t", quote=F, col.names=NA)
+write.table(asv_tax_no_contam, "ASVs_taxonomy-no-contam.tsv",
+            sep="\t", quote=F, col.names=NA)
+
+
+write(summary_tab, "sample_info.tsv")
+
+count_tab <- read.table("ASVs_counts-no-contam.tsv", header=T, row.names=1,
+                        check.names=F, sep="\t")[ , -c(1:4)]
+
+tax_tab <- as.matrix(read.table("ASVs_taxonomy-no-contam.tsv", header=T,
+                                row.names=1, check.names=F, sep="\t"))
+
+
+write.table(metadata, file = "sample_info.tsv", row.names=FALSE, sep="\t")
+
+
+sample_info_tab <- read.table("sample_info.tsv", header=T, row.names=1,
+                              check.names=F, sep="\t")                    
+
+# and setting the color column to be of type "character", which helps later
+sample_info_tab$color<- as.character(sample_info_tab$color)
+
+sample_info_tab
+
+#making sure species group is seen as a factor with levels
+ps@sam_data$wgs.class <- factor(ps@sam_data$wgs.class, levels = c("BCCH", "HYCH", "ADV.CA", "CACH"))
+
+
+#removing Chloroplast and mitochondria
+ps_nochloro <- ps %>%
+  subset_taxa(
+    Kingdom == "Bacteria" &                   #only bacteria
+      Family  != "mitochondria" &             #filter out mitochondria
+      Class   != "Chloroplast"                #filter out chloroplasts
+  )
+
+
+
+
+```
+
+#subsetting just to the cognition metadata and samples
+```{r}
+library(vegan)
+library(dplyr)
+library(ggplot2)
+library(phyloseq)
+library(tidyverse)
+library(dplyr)
+library(readxl)
+
+#upload metadata
+cognition_metadata <- read_xlsx("/Users/russ/Documents/aim_2_paper_cognition/cognition_metadata_simplified.xlsx") #importing the metadata
+
+
+#creating a 'phyloseq' object
+trans_table.no.chimeras<-t(table.no.chimeras)
+otu<-otu_table(trans_table.no.chimeras, taxa_are_rows = TRUE)
+otu<-t(otu)
+samp<-sample_data(cognition_metadata)
+row.names(samp) <- samp$seq_file #altering its format so row names are the sample ids
+tax_tab<-tax_table(tax)
+#phyloseq is essentially a useful bunch of functions for making plots and conducting analyses with this sort of data
+ps <- phyloseq(otu, samp, tax_tab) #making the phyloseq object
+
+#removing Chloroplast and mitochondria
+ps_no_chloro <- physeq_with_tree %>%
+  subset_taxa(
+    Kingdom == "Bacteria" &                   #only bacteria
+      Family  != "mitochondria" &             #filter out mitochondria
+      Class   != "Chloroplast"                #filter out chloroplasts
+  )
+
+# Ensure sample IDs match (assuming sample IDs are in the first column of cognition_metadata)
+sample_ids <- cognition_metadata[[1]]
+
+# Subset the phyloseq object to keep only the samples that match
+ps_cog <- subset_samples(ps_no_chloro, sample_names(ps_no_chloro) %in% sample_ids)
+
+# Check the filtered phyloseq object
+ps_cog
+
+
+#problem solving scores   
+pstake_mean<-mean(cognition_metadata$PS_Test1_solve, na.rm = TRUE)
+print(pstake_mean)
+
+#AL
+cognition_metadata$meanAL_day2to7_score<- suppressWarnings(as.numeric(cognition_metadata$meanAL_day2to7_score))
+
+al_2_7_mean<-mean(cognition_metadata$meanAL_day2to7_score, na.rm = TRUE)
+print(al_2_7_mean)
+
+#RL
+cognition_metadata$meanRL_day2to7_score<- suppressWarnings(as.numeric(cognition_metadata$meanRL_day2to7_score))
+
+rl_2_7_mean<-mean(cognition_metadata$meanRL_day2to7_score, na.rm = TRUE)
+print(rl_2_7_mean)
+```
+
+#adding phylotree data from MAFFT
+```{r}
+library(DECIPHER)
+library(phyloseq)
+library("phangorn")
+library(msa)
+library(dada2)
+library(ape)
+
+#make a tree with MAFFT and FastTree
+tree <- read.tree("/Users/russ/Documents/aim_2_paper_cognition/MAFFT_102824/tree_file")  # Replace "tree_file" with your actual file name.
+
+# Step 1: Check the current taxa names
+current_taxa_names <- taxa_names(ps)
+# Step 2: Rename taxa names to match ASV format
+# Create a new vector for the ASV names (ensure they are unique)
+new_taxa_names <- paste0("ASV_", seq_along(current_taxa_names))
+# Assign the new names to your new phyloseq object
+ps_w_tree<-ps
+taxa_names(ps_w_tree) <- new_taxa_names
+
+# Optional: Check the updated taxa names
+print(taxa_names(ps_w_tree))
+
+# Check if the tree tips match the new taxa names
+tip_labels <- tree$tip.label
+
+
+# Step 1: Identify taxa names in the phyloseq object that are not in the tree tips
+unmatched_taxa <- setdiff(new_taxa_names, tip_labels)
+
+# Step 2: Print unmatched taxa
+if (length(unmatched_taxa) > 0) {
+    cat("The following taxa do not match any tree tips:\n")
+    print(unmatched_taxa)
+} else {
+    cat("All taxa names match the tree tips.\n")
+}
+
+
+
+ps_filtered <- subset_taxa(ps_w_tree, taxa_names(ps_w_tree) %in% tip_labels)
+
+# Now, try merging again
+physeq_with_tree <- merge_phyloseq(ps_filtered, phy_tree(tree))
+
+```
+
+#subsetting the cognition data into species groups subsets 
+```{r}
+# Filter cognition_metadata for wgs.class 
+bcch_data <- cognition_metadata[cognition_metadata$wgs.class == "BCCH", ]
+hych_data <- cognition_metadata[cognition_metadata$wgs.class == "HYCH", ]
+adv.ca_data <- cognition_metadata[cognition_metadata$wgs.class == "ADV.CA", ]
+cach_data <- cognition_metadata[cognition_metadata$wgs.class == "CACH", ]
+
+male_data<-cognition_metadata[cognition_metadata$Sex == "M", ]
+female_data<-cognition_metadata[cognition_metadata$Sex == "F", ]
+
+#replace dataset with each species group 
+# Function to calculate standard error
+standard_error <- function(x) {
+  sd(x, na.rm = TRUE) / sqrt(sum(!is.na(x)))
+}
+
+# Problem solving scores
+pstake_mean <- mean(female_data$PS_Test1_solve, na.rm = TRUE)
+pstake_se <- standard_error(female_data$PS_Test1_solve)
+print(paste("PStake mean:", pstake_mean, "SE:", pstake_se))
+
+# AL scores
+al_2_7_mean <- mean(female_data$meanAL_day2to7_score, na.rm = TRUE)
+al_2_7_se <- standard_error(female_data$meanAL_day2to7_score)
+print(paste("AL 2-7 mean:", al_2_7_mean, "SE:", al_2_7_se))
+
+# RL scores
+rl_2_7_mean <- mean(female_data$meanRL_day2to7_score, na.rm = TRUE)
+rl_2_7_se <- standard_error(female_data$meanRL_day2to7_score)
+print(paste("RL 2-7 mean:", rl_2_7_mean, "SE:", rl_2_7_se))
+
+```
+
+creating a diversity dataframe
+```{r}
+library(vegan)
+library(dplyr)
+library(ggplot2)
+library(phyloseq)
+library(tidyverse)
+
+#make sure all the values are numeric 
+cognition_metadata$PS_Test1_solve<-as.numeric(cognition_metadata$PS_Test1_solve)
+cognition_metadata$meanAL_day2to7_score<-as.numeric(cognition_metadata$meanAL_day2to7_score)
+cognition_metadata$meanRL_day2to7_score<-as.numeric(cognition_metadata$meanRL_day2to7_score)
+
+# Bray-Curtis dissimilarity
+bray <- phyloseq::distance(ps_cog, method = "bray")
+
+# Jaccard dissimilarity
+jaccard <- phyloseq::distance(ps_cog, method = "jaccard")
+
+# Unweighted UniFrac
+unifrac_unweighted <- phyloseq::distance(ps_cog, method = "unifrac")
+
+# Weighted UniFrac
+unifrac_weighted <- phyloseq::distance(ps_cog, method = "wunifrac")
+
+
+#adding faith's phylo diversity 
+# Load required library
+library(picante)
+library(ape)
+
+# Root the tree
+phy_tree_cog <- phy_tree(ps_cog)
+rooted_tree <- root(phy_tree_cog, outgroup = phy_tree_cog$tip.label[1], resolve.root = TRUE)
+
+# Replace the tree in the phyloseq object (optional, if you want to work with the rooted tree in ps_cog)
+phy_tree(ps_cog) <- rooted_tree
+
+
+# Extract tree and OTU table from ps_cog
+phy_tree_cog <- phy_tree(ps_cog)
+otu_cog <- as.matrix(otu_table(ps_cog))
+
+# Calculate Faith's PD
+faith_pd <- pd(otu_cog, phy_tree_cog)$PD
+
+# Create the diversity dataframe
+diversity_df <- data.frame(
+  SampleID = sample_names(ps_cog),
+  Shannon = estimate_richness(ps_cog, measures = "Shannon")[, "Shannon"],
+  Chao = estimate_richness(ps_cog, measures = "Chao1")[, "Chao1"],
+  InvSimpson = estimate_richness(ps_cog, measures = "InvSimpson")[, "InvSimpson"],
+  Richness = estimate_richness(ps_cog, measures = "Observed")[, "Observed"],
+  OTUs = rowSums(otu_table(ps_cog)),
+  FaithPD = faith_pd
+)
+
+
+#making the metadata object and confirming dataframes 
+#meta_data<-sample_data(ps_cog)
+#meta_data <- data.frame(as(meta_data, "matrix"))
+#diversity_df<-as.data.frame(diversity_df)
+
+# Rename seq_file to SampleID in meta_data
+colnames(cognition_metadata)[colnames(cognition_metadata) == "seq_file"] <- "SampleID"
+
+# Combine with metadata
+diversity_df <- merge(diversity_df, cognition_metadata, by = "SampleID")
+
+
+#SEX DIFFERENCES filtering 
+# Filter for all males
+diversity_df_male <- diversity_df %>%
+  filter(Sex == "M")
+# Filter for all females
+diversity_df_female <- diversity_df %>%
+  filter(Sex == "F")
+
+#sex subsetting phyloseq 
+ps_cog_male <- subset_samples(ps_cog, Sex == "M")
+ps_cog_female <- subset_samples(ps_cog, Sex == "F")
+
+# Bray-Curtis dissimilarity
+bray_female <- phyloseq::distance(ps_cog_female, method = "bray")
+bray_male <- phyloseq::distance(ps_cog_male, method = "bray")
+# Jaccard dissimilarity
+jaccard_female <- phyloseq::distance(ps_cog_female, method = "jaccard")
+jaccard_male <- phyloseq::distance(ps_cog_male, method = "jaccard")
+# Unweighted UniFrac
+unifrac_unweighted_male <- phyloseq::distance(ps_cog_male, method = "unifrac")
+unifrac_unweighted_female <- phyloseq::distance(ps_cog_female, method = "unifrac")
+# Weighted UniFrac
+unifrac_weighted_male <- phyloseq::distance(ps_cog_male, method = "wunifrac")
+unifrac_weighted_female <- phyloseq::distance(ps_cog_female, method = "wunifrac")
+
+
+
+library(lme4)
+library(car)
+
+diversity_df$PS_posttrial_take<-as.numeric(diversity_df$PS_posttrial_take)
+diversity_df$PS_Test1_solve<-as.numeric(diversity_df$PS_Test1_solve)
+diversity_df$PS_pretrial<-as.numeric(diversity_df$PS_pretrial)
+diversity_df$meanAL_day2to7_score<-as.numeric(diversity_df$meanAL_day2to7_score)
+diversity_df$meanRL_day2to7_score<-as.numeric(diversity_df$meanRL_day2to7_score)
+
+log_diversity_df<-diversity_df
+log_diversity_df$PS_Test1_solve<-as.numeric(log_diversity_df$PS_Test1_solve)
+
+#log transforming all based on the best fit model 
+log_diversity_df$log_PS_Test1_solve <- log(log_diversity_df$PS_Test1_solve)
+log_diversity_df$log_meanAL_day2to7_score <- log(log_diversity_df$meanAL_day2to7_score)
+log_diversity_df$log_meanRL_day2to7_score <- log(log_diversity_df$meanRL_day2to7_score)
+
+
+#subsetting the diversity_df for removing the PS outliers above or at 7200)
+diversity_df_PS_filtered <- diversity_df %>%
+  filter(PS_Test1_solve != 7200)
+
+
+```
+
+#quantile grouping 
+```{r}
+#finding the quantiles of the different groups 
+#PROBLEEM SOLVING GROUPS
+# Create a basic histogram to see the distribution of PS_Test1_solve
+ggplot(cognition_metadata, aes(x = PS_Test1_solve)) +
+  geom_histogram(binwidth = 200, fill = "steelblue", color = "black", alpha = 0.7) + # Customize bin width, color, and transparency
+  labs(title = "Distribution of PS Test Solve", x = "PS Test Solve", y = "Frequency") + # Axis labels and title
+  theme_minimal() # Use a minimal theme for cleaner visualization
+
+# Calculate quantiles
+PSquantiles <- quantile(cognition_metadata$PS_Test1_solve, probs = c(0.33, 0.66), na.rm = TRUE) 
+
+# Print quantiles
+PSquantiles
+
+#PSquantiles
+#    33%     66% 
+# 184.95 1092.50 
+
+# Specify breaks and labels
+breaks <- c(-Inf, 185, 1093, 6000)
+labels <- c("Good", "Mediocre", "Poor")
+
+# Create 'PS_category' based on 'PS_Test1_solve'
+cognition_metadata$PS_category <- cut(cognition_metadata$PS_Test1_solve, breaks = breaks, labels = labels, include.lowest = TRUE)
+ps_cog@sam_data$PS_category<-cognition_metadata$PS_category
+
+#see total PS_category groups for each species groups
+sum_by_category <- cognition_metadata %>%
+  filter(wgs.class %in% c("CACH", "ADV.CA", "BCCH", "HYCH")) %>%
+  group_by(PS_category, wgs.class) %>%
+  summarise(total_individuals = n())
+
+# Print the result
+print(sum_by_category)
+
+
+
+#PROBLEM SOLVING QUANTILES WITHOUT THE 7200s individuals that didn't solve
+# Calculate quantiles
+PSquantiles <- quantile(diversity_df$PS_Test1_solve, probs = c(0.33, 0.66), na.rm = TRUE) 
+
+# Print quantiles
+PSquantiles
+
+#PSquantiles
+#    33%     66% 
+# 160.05 505.26 
+
+# Specify breaks and labels
+breaks <- c(-Inf, 160.05, 505.26, 7200)
+labels <- c("Good", "Mediocre", "Poor")
+
+# Create 'PS_category' based on 'PS_Test1_solve'
+filtered_df$PS_category <- cut(filtered_df$PS_Test1_solve, breaks = breaks, labels = labels, include.lowest = TRUE)
+ps_cog@sam_data$PS_category<-filtered_df$PS_category
+
+#see total PS_category groups for each species groups
+sum_by_category <- filtered_df %>%
+  filter(wgs.class %in% c("CACH", "ADV.CA", "BCCH", "HYCH")) %>%
+  group_by(PS_category, wgs.class) %>%
+  summarise(total_individuals = n())
+
+# Print the result
+print(sum_by_category)
+
+
+
+
+
+
+
+
+
+#AL TEST GROUPS
+# Create a basic histogram to see the distribution of meanAL_day2to7_score
+ggplot(cognition_metadata, aes(x = meanAL_day2to7_score)) +
+  geom_histogram(binwidth = 3, fill = "steelblue", color = "black", alpha = 0.7) + # Customize bin width, color, and transparency
+  labs(title = "Distribution of mean AL", x = "AL mean", y = "Frequency") + # Axis labels and title
+  theme_minimal() # Use a minimal theme for cleaner visualization
+
+# Calculate quantiles
+ALquantiles <- quantile(cognition_metadata$meanAL_day2to7_score, probs = c(0.33, 0.66), na.rm = TRUE) 
+
+# Print quantiles
+ALquantiles
+
+#ALquantiles
+#     33%      66% 
+# 3.833333 6.98333
+
+# Specify breaks and labels
+breaks <- c(-Inf, 4, 7, 15)
+labels <- c("Good", "Mediocre", "Poor")
+
+# Create 'AL_category' based on 'meanAL_day2to7_score'
+cognition_metadata$AL_category <- cut(cognition_metadata$meanAL_day2to7_score, breaks = breaks, labels = labels, include.lowest = TRUE)
+ps_cog@sam_data$AL_category<-cognition_metadata$AL_category
+
+#see total AL_category groups for each species groups
+sum_by_category <- cognition_metadata %>%
+  filter(wgs.class %in% c("CACH", "ADV.CA", "BCCH", "HYCH")) %>%
+  group_by(AL_category, wgs.class) %>%
+  summarise(total_individuals = n())
+
+# Print the result
+print(sum_by_category)
+
+
+
+#RL TEST GROUPS
+# Create a basic histogram to see the distribution of meanRL_day2to7_score
+ggplot(cognition_metadata, aes(x = meanRL_day2to7_score)) +
+  geom_histogram(binwidth = 3, fill = "steelblue", color = "black", alpha = 0.7) + # Customize bin width, color, and transparency
+  labs(title = "Distribution of mean RL", x = "RL mean", y = "Frequency") + # Axis labels and title
+  theme_minimal() # Use a minimal theme for cleaner visualization
+
+# Calculate quantiles
+RLquantiles <- quantile(cognition_metadata$meanRL_day2to7_score, probs = c(0.33, 0.66), na.rm = TRUE) 
+
+# Print quantiles
+RLquantiles
+
+#RLquantiles
+#     33%      66% 
+# 4.413000 7.043333 
+
+# Specify breaks and labels
+breaks <- c(-Inf, 4, 7, 15)
+labels <- c("Good", "Mediocre", "Poor")
+
+# Create 'RL_category' based on 'meanRL_day2to7_score'
+cognition_metadata$RL_category <- cut(as.numeric(cognition_metadata$meanRL_day2to7_score), breaks = breaks, labels = labels, include.lowest = TRUE)
+ps_cog@sam_data$RL_category<-cognition_metadata$RL_category
+
+#see total RL_category groups for each species groups
+sum_by_category <- cognition_metadata %>%
+  filter(wgs.class %in% c("CACH", "ADV.CA", "BCCH", "HYCH")) %>%
+  group_by(RL_category, wgs.class) %>%
+  summarise(total_individuals = n())
+
+# Print the result
+print(sum_by_category)
+
+
+```
+
+#finding 0.1% MRA for full phyloseq and each ancestry group
+```{r}
+library(phyloseq)
+
+ps_cog_rel <- transform_sample_counts(ps_cog, function(x) x / sum(x))
+
+ps_cog_phylum <- tax_glom(ps_cog_rel, taxrank = "Phylum")
+
+library(phyloseq)
+library(tidyverse)
+
+# Step 1: Transform to relative abundance
+ps_rel <- transform_sample_counts(ps_cog_phylum, function(x) x / sum(x))
+
+# Step 2: Aggregate at Phylum level (skip if already at Phylum level)
+ps_phylum <- tax_glom(ps_rel, taxrank = "Phylum")
+
+# Step 3: Convert to long tidy format
+df <- psmelt(ps_phylum)
+
+# Step 4: Get phyla with mean relative abundance > 0.001 (i.e., 0.1%) overall
+top_phyla_overall <- df %>%
+  group_by(Phylum) %>%
+  summarise(mean_abundance = mean(Abundance, na.rm = TRUE)) %>%
+  filter(mean_abundance > 0.001)
+
+# Step 5: Get phyla with MRA > 0.1% within each wgs.class
+top_phyla_by_group <- df %>%
+  group_by(wgs.class, Phylum) %>%
+  summarise(mean_abundance = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  filter(mean_abundance > 0.001)
+
+# Optional: Convert to a list per group if needed
+top_phyla_list <- top_phyla_by_group %>%
+  group_by(wgs.class) %>%
+  summarise(top_phyla = list(unique(Phylum)))
+
+
+
+library(tidyverse)
+
+# Replace this with your actual data frame if you're loading from a CSV or other source
+MRA_results <- tribble(
+  ~wgs.class, ~Phylum, ~mean_abundance,
+  "ADV.CA", "Actinobacteriota", 0.031623417,
+  "ADV.CA", "Bacteroidota", 0.015501532,
+  "ADV.CA", "Firmicutes", 0.559851616,
+  "ADV.CA", "Proteobacteria", 0.391802061,
+  "BCCH", "Actinobacteriota", 0.028273810,
+  "BCCH", "Bacteroidota", 0.025079829,
+  "BCCH", "Bdellovibrionota", 0.001316135,
+  "BCCH", "Chloroflexi", 0.004742399,
+  "BCCH", "Firmicutes", 0.774307465,
+  "BCCH", "Planctomycetota", 0.002178613,
+  "BCCH", "Proteobacteria", 0.163424916,
+  "CACH", "Actinobacteriota", 0.063454610,
+  "CACH", "Bacteroidota", 0.013351339,
+  "CACH", "Firmicutes", 0.530274749,
+  "CACH", "Planctomycetota", 0.001989554,
+  "CACH", "Proteobacteria", 0.388160410,
+  "CACH", "Verrucomicrobiota", 0.002271448,
+  "HYCH", "Actinobacteriota", 0.095898014,
+  "HYCH", "Bacteroidota", 0.005272861,
+  "HYCH", "Cyanobacteria", 0.008316126,
+  "HYCH", "Firmicutes", 0.683226471,
+  "HYCH", "Proteobacteria", 0.207286528
+)
+
+# Pivot to wide format
+wide_MRA_results <- MRA_results %>%
+  pivot_wider(names_from = Phylum, values_from = mean_abundance) %>%
+  column_to_rownames("wgs.class")  # optional: set rownames
+
+# View the resulting wide-format table
+print(wide_MRA_results)
+
+wide_MRA_results<-t(wide_MRA_results)
+
+write.csv(wide_MRA_results, file = "~/Desktop/phyla_abundance_table.csv", row.names = TRUE)
+
+
+
+```
+
+PCoA beta Diversity graphs 
+```{r}
+
+#choose which distance matrix to use
+nmds_cog_jaccard <- ordinate(ps_cog, method = "NMDS", distance = jaccard)
+pcoa_cog_jaccard <- ordinate(ps_cog, method = "PCoA", distance = jaccard)
+
+nmds_cog_bray <- ordinate(ps_cog, method = "NMDS", distance = bray)
+pcoa_cog_bray <- ordinate(ps_cog, method = "PCoA", distance = bray)
+
+nmds_cog_uniunweight <- ordinate(ps_cog, method = "NMDS", distance = unifrac_unweighted)
+pcoa_cog_uniunweight <- ordinate(ps_cog, method = "PCoA", distance = unifrac_unweighted)
+
+
+# Extract sample data and NMDS scores
+nmds_scores <- as.data.frame(nmds_cog_uniunweight$points)
+pcoa_scores <- as.data.frame(pcoa_cog_uniunweight$vectors)
+
+sample_data<-ps_cog@sam_data
+# Combine sample data and NMDS scores
+nmds_data <- cbind(sample_data, nmds_scores)
+nmds_data <- subset(nmds_data, 
+                    !is.na(wgs.class) & 
+                    !is.na(nmds_data$PS_category) & 
+                    !is.na(nmds_data$NT_category) & 
+                    !is.na(nmds_data$AL_category) & 
+                    !is.na(nmds_data$RL_category))
+
+
+pcoa_data <- cbind(sample_data, pcoa_scores)
+pcoa_data <- subset(pcoa_data, 
+                    !is.na(wgs.class) & 
+                    !is.na(pcoa_data$PS_category) & 
+                    !is.na(pcoa_data$NT_category) & 
+                    !is.na(pcoa_data$AL_category) & 
+                    !is.na(pcoa_data$RL_category))
+
+
+# Plot NMDS
+nmds_plot <- ggplot(nmds_data, aes(x = MDS1, y = MDS2, color = RL_category)) +
+  geom_point(size = 3) +
+  labs(title = "NMDS of Beta Diversity (UniFrac Unweighted)") +
+  theme_minimal() +
+  stat_ellipse()
+
+
+pdf("/Users/russ/Desktop/nmds_plot.pdf", width = 10, height = 10)
+print(nmds_plot)
+dev.off()
+
+print(nmds_plot)
+
+
+# PCoA plot
+PCoA_plot<-ggplot(pcoa_data, aes(x = Axis.1, y = Axis.2, color = AL_category, shape = AL_category)) +
+  geom_point(size = 4, alpha = 0.8) +
+  theme_minimal() +
+  labs(
+    x = paste0("PCoA Axis 1 (", round(pcoa_data$values$Relative_eig[1] * 100, 1), "% variance)"),
+    y = paste0("PCoA Axis 2 (", round(pcoa_data$values$Relative_eig[2] * 100, 1), "% variance)"),
+    color = "wgs.class",
+    shape = "wgs.class"
+  ) +
+  theme(
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14, face = "bold")
+  )+
+  stat_ellipse()
+
+pdf("/Users/russ/Desktop/PCoA_plot.pdf", width = 10, height = 10)
+print(PCoA_plot)
+dev.off()
+
+print(PCoA_plot)
+
+
+```
+
+DESeq work for bacteria comparisons across cog groups 
+```{r}
+# Filter out individuals who did not complete the test (PS_Test1_solve == 7200)
+ps_cog_filtered <- subset_samples(ps_cog, PS_Test1_solve != 7200)
+
+#Deseq of cog categories (subset the *_category with the test you want to look at)
+
+library(phyloseq)
+library(DESeq2)
+
+#replace X_category with whichever test you are looking at results for 
+
+table(sample_data(ps_cog_filtered)$RL_category, useNA = "always")
+
+#make an NA clean phyloseq
+ps_cog_clean <- subset_samples(ps_cog_filtered, !is.na(RL_category))
+
+#make sure the levels are correct
+sample_data(ps_cog_clean)$RL_category <- factor(sample_data(ps_cog_clean)$RL_category, levels = c("Poor", "Mediocre", "Good"))
+
+# make small numbers and get rid of low abundance bc DESeq2 doesn't handle it well
+ps_cog_clean <- filter_taxa(ps_cog_clean, function(x) sum(x > 0) > (0.1 * length(x)), TRUE)
+
+# Create DESeq2 object with RL_category as the design variable
+dds <- phyloseq_to_deseq2(ps_cog_clean, ~ RL_category)
+
+# Estimate size factors and dispersions. the "poscounts" This uses positive counts only for estimating size factors, which works much better for sparse datasets like ASV tables. this code skips zeros when estimating size factors, avoiding undefined log operations.
+dds <- DESeq(dds, sfType = "poscounts")
+
+summary(dds)
+
+# Good vs Poor
+res_good_poor <- results(dds, contrast = c("RL_category", "Good", "Poor"))
+
+# Mediocre vs Poor
+res_med_poor <- results(dds, contrast = c("RL_category", "Mediocre", "Poor"))
+
+# Good vs Mediocre
+res_good_med <- results(dds, contrast = c("RL_category", "Good", "Mediocre"))
+
+#creates FDR threshold
+res_good_poor_sig <- res_good_poor[which(res_good_poor$padj < 0.05), ]
+
+
+library(ggplot2)
+
+# Extract normalized counts
+norm_counts <- counts(dds, normalized = TRUE)
+top_taxa <- rownames(res_good_poor_sig)[1:min(10, nrow(res_good_poor_sig))]
+
+# Melt and plot
+library(reshape2)
+# Step 1: Get normalized counts of top significant ASVs
+norm_counts <- counts(dds, normalized = TRUE)
+df_DESeq <- as.data.frame(t(norm_counts[top_taxa, ]))
+
+# Step 2: Add SampleID as a column
+df_DESeq$SampleID <- rownames(df_DESeq)
+
+# Step 3: Add only the PS_category metadata
+meta_df <- data.frame(sample_data(ps_cog_clean))
+meta_df$SampleID <- rownames(meta_df)
+meta_df <- meta_df[, c("SampleID", "RL_category")]
+
+# Step 4: Merge
+df_DESeq <- merge(df_DESeq, meta_df, by = "SampleID")
+df_DESeq_melt <- melt(df_DESeq, id.vars = c("SampleID", "RL_category"))
+
+DESeq_RL_good_poor<-ggplot(df_DESeq_melt, aes(x = RL_category, y = value, fill = RL_category)) +
+  geom_boxplot() +
+  facet_wrap(~ variable, scales = "free_y") +
+  theme_bw() +
+  ylab("Normalized Abundance") +
+  xlab("RL_category") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save the plot to a PDF
+pdf("/Users/russ/Desktop/DESeq_RL_good_poor.pdf", width = 10, height = 10)
+print(DESeq_RL_good_poor)
+dev.off()
+
+
+#log transforming for visualization 
+log_DESeq_RL<-ggplot(df_DESeq_melt, aes(x = RL_category, y = log10(value + 1), fill = RL_category)) +
+  geom_boxplot() +
+  facet_wrap(~ variable, scales = "free_y") +
+  theme_bw() +
+  ylab("Log10 Normalized Abundance") +
+  xlab("RL_category")
+
+# Save the plot to a PDF
+pdf("/Users/russ/Desktop/log_DESeq_RL.pdf", width = 10, height = 10)
+print(log_DESeq_RL)
+dev.off()
+
+
+
+#adding the genus name instead of ASV#
+# Pull taxonomy table
+tax_DESeq <- as.data.frame(tax_table(ps_cog_clean))
+
+# Add a column of ASV IDs to match
+tax_DESeq$ASV <- rownames(tax_DESeq)
+
+# For simplicity, keep only ASV and Genus
+tax_short <- tax_DESeq[, c("ASV", "Genus")]
+
+# Optional: Fill in missing genus names with ASV IDs
+tax_short$Genus[is.na(tax_short$Genus) | tax_short$Genus == ""] <- tax_short$ASV[is.na(tax_short$Genus) | tax_short$Genus == ""]
+
+# Create a lookup vector
+asv_to_genus <- setNames(tax_short$Genus, tax_short$ASV)
+
+df_DESeq_melt$Genus <- asv_to_genus[as.character(df_DESeq_melt$variable)]
+
+
+genus_log_RL<-ggplot(df_DESeq_melt, aes(x = RL_category, y = log10(value + 1), fill = RL_category)) +
+  geom_boxplot() +
+  facet_wrap(~ Genus, scales = "free_y") +
+  theme_bw() +
+  ylab("Log10 Normalized Abundance") +
+  xlab("RL_category") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save the plot to a PDF
+pdf("/Users/russ/Desktop/genus_log_RL.pdf", width = 10, height = 10)
+print(genus_log_RL)
+dev.off()
+
+
+
+
+
+
+
+#getting the p values 
+# convert results to dataframe if needed
+res_df <- as.data.frame(res_good_poor)
+
+# Add ASV IDs
+res_df$ASV <- rownames(res_df)
+
+# Filter for top_taxa
+top_results <- res_df[rownames(res_df) %in% top_taxa, ]
+
+# Add Genus
+top_results$Genus <- asv_to_genus[top_results$ASV]
+
+# Select key columns
+top_results_clean <- top_results[, c("ASV", "Genus", "log2FoldChange", "pvalue", "padj", "baseMean")]
+
+# Sort by adjusted p-value
+top_results_clean <- top_results_clean[order(top_results_clean$padj), ]
+
+print(top_results_clean)
+
+write.csv(top_results_clean, "~/Desktop/top_deseq2_taxa_RL.csv", row.names = FALSE)
+```
+
+```{r}
+#error bar comparisons 
+# Convert results to dataframes and add comparison labels
+df_good_poor <- as.data.frame(res_good_poor) %>%
+  tibble::rownames_to_column("ASV") %>%
+  mutate(Comparison = "Good vs Poor")
+
+df_med_poor <- as.data.frame(res_med_poor) %>%
+  tibble::rownames_to_column("ASV") %>%
+  mutate(Comparison = "Mediocre vs Poor")
+
+df_good_med <- as.data.frame(res_good_med) %>%
+  tibble::rownames_to_column("ASV") %>%
+  mutate(Comparison = "Good vs Mediocre")
+
+# Combine
+df_all <- bind_rows(df_good_poor, df_med_poor, df_good_med)
+
+tax_DESeq <- as.data.frame(tax_table(ps_cog_clean)) %>%
+  tibble::rownames_to_column("ASV")
+
+df_all <- left_join(df_all, tax_DESeq[, c("ASV", "Genus")], by = "ASV")
+
+# Replace missing Genus names with ASV IDs
+df_all$Genus[is.na(df_all$Genus) | df_all$Genus == ""] <- df_all$ASV[is.na(df_all$Genus) | df_all$Genus == ""]
+
+
+library(ggplot2)
+#fix this and fill in with the signifianct ASVs found from the DESeq2 run top_results_clean
+df_sig_asvs <- df_all %>% filter(ASV %in% c("ASV_47", "ASV_119", "ASV_548"))
+
+
+RL_sig_ASVs<-ggplot(df_sig_asvs, aes(x = log2FoldChange, y = Genus)) +
+  geom_point(color = "black") +
+  geom_errorbarh(aes(xmin = log2FoldChange - lfcSE,
+                     xmax = log2FoldChange + lfcSE),
+                 height = 0.2, color = "black") +
+  facet_wrap(~ Comparison, scales = "free_x") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  xlab("Log2 Fold Change ± s.e.") +
+  ylab("")
+
+# Save the plot to a PDF
+pdf("/Users/russ/Desktop/RL_sig_ASVs.pdf", width = 10, height = 5)
+print(RL_sig_ASVs)
+dev.off()
+
+
+```
+
+#POST HOC STUFF AT ASV LEVEL
+post hoc for the comparison of sig ASVs between cognition groups 
+```{r}
+
+# Identify significant ASVs from each comparison
+sig_good_poor <- rownames(res_good_poor)[which(res_good_poor$padj < 0.05)]
+sig_med_poor  <- rownames(res_med_poor)[which(res_med_poor$padj < 0.05)]
+sig_good_med  <- rownames(res_good_med)[which(res_good_med$padj < 0.05)]
+
+# Union of all significant ASVs
+sig_asvs <- unique(c(sig_good_poor, sig_med_poor, sig_good_med))
+
+
+# Create data frame with post hoc comparison results
+posthoc_df <- data.frame(
+  ASV = sig_asvs,
+  log2FC_good_poor = res_good_poor[sig_asvs, "log2FoldChange"],
+  padj_good_poor = res_good_poor[sig_asvs, "padj"],
+  
+  log2FC_med_poor = res_med_poor[sig_asvs, "log2FoldChange"],
+  padj_med_poor = res_med_poor[sig_asvs, "padj"],
+  
+  log2FC_good_med = res_good_med[sig_asvs, "log2FoldChange"],
+  padj_good_med = res_good_med[sig_asvs, "padj"]
+)
+
+
+# Add Genus column
+posthoc_df$Genus <- tax_short$Genus[match(posthoc_df$ASV, tax_short$ASV)]
+
+view(posthoc_df)
+
+```
+
+#alpha diversity testing 
+```{r}
+
+#reformat this part for each of the different cognition tests and adjust for simplification as needed for each test 
+#SHANNON DIVERSITY
+#simplified version
+shan.cog <- lmer(log(meanRL_day2to7_score) ~ Shannon*wgs.class*Sex  + (1|Nest/Collection_year) + (1|Nest_Site), data = diversity_df)
+summary(shan.cog)
+#check the Anova 
+Anova(shan.cog)
+
+# First round of model simplification
+shan.cog.new1 <- update(shan.cog, ~ . 
+  - wgs.class:Sex
+  - Shannon:Sex
+  - Shannon:wgs.class
+  - Shannon:wgs.class:Sex)
+
+summary(shan.cog.new1)
+anova(shan.cog,shan.cog.new1)
+Anova(shan.cog.new1)
+
+#adding chi squared and p values 
+df_complete <- na.omit(diversity_df[, c("PS_Test1_solve", "meanAL_day2to7_score", "meanRL_day2to7_score", "Shannon", "Chao", "OTUs", "FaithPD", "wgs.class", "Sex", 
+                                       "Nest", "Collection_year", "Nest_Site")])
+null <- lmer(meanRL_day2to7_score ~ 1 + (1 | Collection_year/Nest) + (1|Nest_Site), data=df_complete)
+anova(shan.cog, null)
+
+
+
+#CHAO DIVERSITY
+#simplified version
+chao.cog <- lmer(log(meanRL_day2to7_score) ~ Chao*wgs.class*Sex + (1|Nest/Collection_year) + (1|Nest_Site), data = diversity_df)
+summary(chao.cog)
+#check the Anova 
+Anova(chao.cog)
+
+# First round of model simplification
+chao.cog.new1 <- update(chao.cog, ~ . 
+  - Chao:Sex:wgs.class
+  - wgs.class:Sex
+  - Chao:wgs.class
+  - Chao:Sex)
+
+summary(chao.cog.new1)
+anova(chao.cog,chao.cog.new1)
+Anova(chao.cog.new1)
+
+#adding chi squared and p values 
+null <- lmer(meanRL_day2to7_score ~ 1 + (1 | Collection_year/Nest) + (1|Nest_Site), data=df_complete)
+anova(chao.cog.new1, null)
+
+
+
+#NUMBER OF ASVs
+#simplified version
+#asvnum.cog <- lmer(PS_Test1_solve ~ OTUs*wgs.class*Sex  + (1|Nest/Collection_year) + (1|Nest_Site), data = diversity_df)
+#summary(asvnum.cog)
+#check the Anova 
+#Anova(asvnum.cog)
+
+# First round of model simplification
+#asvnum.cog.new1 <- update(asvnum.cog, ~ . 
+#  - OTUs:Sex
+#  - wgs.class:Sex
+#  - OTUs:wgs.class:Sex
+#  - OTUs:wgs.class)
+
+#summary(asvnum.cog.new1)
+#anova(asvnum.cog,asvnum.cog.new1)
+#Anova(asvnum.cog.new1)
+
+#adding chi squared and p values 
+#null <- lmer(meanRL_day2to7_score ~ 1 + (1 | Collection_year/Nest) + (1|Nest_Site), data=df_complete)
+#anova(asvnum.cog.new1, null)
+
+
+#Faith's phylo diversity
+#simplified version
+faith.cog <- lmer(log(meanRL_day2to7_score) ~ FaithPD*wgs.class*Sex  + (1|Nest/Collection_year) + (1|Nest_Site), data = diversity_df)
+summary(faith.cog)
+#check the Anova 
+Anova(faith.cog)
+
+# First round of model simplification
+faith.cog.new1 <- update(faith.cog, ~ . 
+  -FaithPD:Sex
+  -FaithPD:wgs.class:Sex
+  -wgs.class:Sex
+  -FaithPD:wgs.class)
+
+summary(faith.cog.new1)
+anova(faith.cog,faith.cog.new1)
+Anova(faith.cog.new1)
+
+
+# Refit null model on that same dataset
+null <- lmer(PS_Test1_solve ~ 1 + (1|Nest/Collection_year) + (1|Nest_Site),
+             data = diversity_df_PS_filtered)
+anova(faith.cog.new1, null)
+
+#####
+
+```
+
+#beta diversity
+```{r}
+
+#perform PERMANOVA
+#testing bray jaccard unifrac_weighted unifrac_unweighted
+perm_cog_df <- data.frame(sample_data(ps_cog))
+
+permanova_bray <- adonis2(unifrac_weighted ~ RL_category+Sex+wgs.class , 
+                            data = diversity_df, 
+                            permutations = 10000, 
+                            na.action = "na.exclude")
+print(permanova_bray)
+
+
+
+# Impute missing values in PS_Test1_solve with the mean
+diversity_clean<-diversity_df
+
+diversity_clean$PS_Test1_solve[is.na(diversity_clean$PS_Test1_solve)] <- 
+  mean(diversity_clean$PS_Test1_solve, na.rm = TRUE)
+# Impute missing values in Sex with the most frequent category
+diversity_clean$Sex[is.na(diversity_clean$Sex)] <- 
+  names(sort(table(diversity_clean$Sex), decreasing = TRUE))[1]
+# Impute missing values in wgs.class with the most frequent category
+diversity_clean$wgs.class[is.na(diversity_clean$wgs.class)] <- 
+  names(sort(table(diversity_clean$wgs.class), decreasing = TRUE))[1]
+
+# Perform db-RDA
+db_rda <- vegan::capscale(unifrac_weighted ~ PS_Test1_solve + Sex + wgs.class, 
+                           data = diversity_clean, 
+                           distance = "bray")
+# Summarize results
+summary(db_rda)
+# ANOVA-like test to assess significance
+anova(db_rda, permutations = 10000)
+
+
+
+
+
+permanova_jaccard <- adonis2(jaccard ~ meanRL_day2to7_score + Sex + wgs.class, 
+                            data = diversity_df, 
+                            permutations = 10000, 
+                            na.action = "na.exclude") 
+                        
+print(permanova_jaccard)
+
+
+permanova_unifrac_unweighted <- adonis2(unifrac_unweighted ~ meanRL_day2to7_score + Sex + wgs.class, 
+                            data = diversity_df, 
+                            permutations = 10000, 
+                            na.action = "na.exclude", 
+                            by = "margin")
+print(permanova_unifrac_unweighted)
+
+permanova_unifrac_weighted <- adonis2(unifrac_weighted ~ meanRL_day2to7_score + Sex + wgs.class, 
+                            data = diversity_df, 
+                            permutations = 10000, 
+                            na.action = "na.exclude", 
+                            by = "margin")
+print(permanova_unifrac_weighted)
+
+```
+
+#graphs of significant interactions and aspects of alpha diversity
+```{r}
+library(cowplot)
+
+#filter out NAs in wgs.class column 
+library(dplyr)
+PS_Faith_graph_df <- filtered_df %>%
+  filter(!is.na(wgs.class))
+
+#log PS and faith with ancestry
+PS_faith_wgs_sex_ <- ggplot(PS_Faith_graph_df, aes(x = FaithPD, y = PS_Test1_solve, color = wgs.class)) +
+  geom_point(size = 3) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,  # Add 95% confidence intervals
+    aes(linetype = wgs.class),  # Maintain separate lines and CIs by sex
+    size = 1
+  ) +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted", "dotdash")) +  # Adjust for number of groups
+  labs(
+    x = "Faith's Phylogenetic Diversity", 
+    y = "Problem Solving Score", 
+    color = "Ancestry Group", 
+    linetype = "Ancestry Group"
+  ) +
+  theme_minimal() +
+  theme_cowplot(12)
+
+
+pdf("/Users/russ/Desktop/PS_shan_wgs_sex_.pdf", width = 7, height = 5)
+print(PS_faith_wgs_sex_)
+dev.off()
+
+
+#same problem solving graph as above but no individuals that did not complete the test (scores of 7200 seconds)
+# Filter out individuals with a score of 7200
+filtered_df <- diversity_df %>% 
+  filter(PS_Test1_solve != 7200)
+
+# Then use the filtered data in your plot
+PS_faith_wgs_sex_filt <- ggplot(diversity_df, aes(x = Chao, y = PS_Test1_solve, color = wgs.class)) +
+  geom_point(size = 3) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    aes(linetype = wgs.class),
+    size = 1
+  ) +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted", "dotdash")) +
+  labs(
+    x = "Chao Diversity", 
+    y = "Problem Solving Score", 
+    color = "Ancestry Group", 
+    linetype = "Ancestry Group"
+  ) +
+  theme_minimal() +
+  theme_cowplot(12) 
+
+
+print(PS_faith_wgs_sex_filt)
+
+#slopes of the lines in the graph 
+library(emmeans)
+model <- lm(PS_Test1_solve ~ FaithPD * wgs.class, data = PS_Faith_graph_df)
+
+emmeans_results <- emtrends(model, spec = "wgs.class", var = "FaithPD")
+view(emmeans_results)
+
+
+
+faith_RL <- ggplot(log_diversity_df, aes(x = FaithPD, y = log_meanRL_day2to7_score)) +
+  geom_point(aes(size = 3)) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    color = "black",
+    size = 1
+  ) +
+  labs(
+    x = "Faith's Phylogenetic Diversity",
+    y = "Reversal Learning Score",
+    shape = "Sex"
+  ) +
+  theme_minimal() +
+  theme_cowplot(12)
+
+
+
+pdf("/Users/russ/Desktop/faith_RL.pdf", width = 10, height = 10)
+print(faith_RL)
+dev.off()
+
+
+
+
+#ASV and RL test comparison 
+
+otu_wgs_sex <- ggplot(diversity_df, aes(x = OTUs, y = meanRL_day2to7_score, color = Sex, shape = Sex)) +
+  geom_point(size = 3) +
+  geom_smooth(
+    method = "lm", 
+    se = TRUE,  # Show 95% confidence intervals
+    aes(linetype = Sex), 
+    size = 1
+  ) + 
+  scale_linetype_manual(values = c("solid", "dashed")) +  # Assuming two sexes
+  labs(
+    x = "Number of ASVs", 
+    y = "Reversal Learning Score", 
+    color = "Sex", 
+    shape = "Sex", 
+    linetype = "Sex"
+  ) +
+  theme_minimal() +
+  theme_cowplot(12) +
+  facet_wrap(~wgs.class)
+
+
+
+pdf("/Users/russ/Desktop/otu_wgs_sex.pdf", width = 10, height = 10)
+print(otu_wgs_sex)
+dev.off()
+
+
+
+#filter out NAs in Sex column 
+library(dplyr)
+ASV_graph_df <- diversity_df %>%
+  filter(!is.na(Sex))
+
+#same comparison as above with OTUs but sex panels and wgs lines instead 
+wgs_by_sex<-ggplot(ASV_graph_df, aes(x = OTUs, y = meanRL_day2to7_score, color = wgs.class, linetype = wgs.class)) +
+  geom_point(aes(shape = wgs.class), size = 3) +
+  geom_smooth(
+    method = "lm", 
+    se = FALSE,  # <-- removes shaded confidence intervals
+    size = 1
+  ) + 
+  scale_linetype_manual(values = c("solid", "dashed", "dotdash", "twodash")) +
+  labs(
+    x = "Number of ASVs", 
+    y = "Reversal Learning Score", 
+    color = "Ancestry Group", 
+    shape = "Ancestry Group", 
+    linetype = "Ancestry Group"
+  ) +
+  theme_minimal() +
+  theme_cowplot(12) +
+  facet_wrap(~Sex)
+
+pdf("/Users/russ/Desktop/wgs_by_sex.pdf", width = 10, height = 5)
+print(wgs_by_sex)
+dev.off()
+
+
+
+
+#just the ASVs and the reversal learning significant relationship graphed
+ASV_RL_graph<-ggplot(diversity_df, aes(x = OTUs, y = meanRL_day2to7_score)) +
+  geom_point(size = 3, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "black", size = 1) +
+  labs(
+    x = "Number of ASVs", 
+    y = "Reversal Learning Score"
+  ) +
+  theme_minimal() +
+  theme_cowplot(12)
+
+pdf("/Users/russ/Desktop/ASV_RL_graph.pdf", width = 5, height = 5)
+print(ASV_RL_graph)
+dev.off()
+```
+
+#post hoc work 
+```{r}
+#adjust and fill in each cognition test or interactions as needed based on significant findings from above alpha testing
+library(emmeans)
+
+# Get pairwise comparisons for the interaction
+model <- lm(PS_Test1_solve ~ FaithPD * wgs.class, data = filtered_df)
+
+emmeans_results <- emtrends(model, spec = "wgs.class", var = "FaithPD")
+view(emmeans_results)
+
+emmeans_results <- emtrends(shan.cog, specs = ~ wgs.class * Sex, var = "Shannon")
+
+
+
+
+#post hoc comparison for ASVs in the RL test keeping contrasts within sex for ancestry differences 
+
+model <- lmer(log(meanRL_day2to7_score)~OTUs*wgs.class*Sex + (1|Collection_year/Nest) + (1|Nest), data=diversity_df)
+ABC <- emtrends(model, pairwise ~ wgs.class:Sex, var= "OTUs", by= "Sex")
+summary(ABC)
+
+
+
+
+#comparing the slopes 
+# Fit the interaction model
+model <- lm(PS_Test1_solve ~ FaithPD * wgs.class, data = filtered_df)
+summary(model)
+
+library(emmeans)
+
+# Estimate the FaithPD slope per group
+emtrends_model <- emtrends(model, var = "FaithPD", specs = "wgs.class")
+
+# Pairwise comparisons of those slopes
+pairs(emtrends_model)
+
+
+
+```
+
+extract all the chi-square stats from likelihood ratio tests and the pseudo-F from PERMANOVAs
+```{r}
+#Alpha Diversity: LRT chi-square (final vs. null) 
+
+# Null model 
+df_complete <- na.omit(diversity_df[, c("meanAL_day2to7_score", "meanRL_day2to7_score",
+                                         "PS_Test1_solve", "Shannon", "Chao", "OTUs",
+                                         "FaithPD", "wgs.class", "Sex",
+                                         "Nest", "Collection_year", "Nest_Site")])
+
+null <- lmer(log(meanRL_day2to7_score) ~ 1 + (1|Nest/Collection_year) + (1|Nest_Site),
+             data = df_complete)
+
+# Shannon
+lrt_shannon <- anova(shan.cog.new1, null)
+cat("Shannon LRT:\n")
+print(lrt_shannon)
+
+# Chao
+lrt_chao <- anova(chao.cog.new1, null)
+cat("Chao LRT:\n")
+print(lrt_chao)
+
+# Faith's PD
+lrt_faith <- anova(faith.cog.new1, null)
+cat("Faith PD LRT:\n")
+print(lrt_faith)
+
+#  Compile alpha diversity chi-square table 
+
+alpha_chisq_table <- data.frame(
+  Model     = c("Shannon", "Chao", "FaithPD"),
+  ChiSq     = c(lrt_shannon$Chisq[2],   lrt_chao$Chisq[2],   lrt_faith$Chisq[2]),
+  df        = c(lrt_shannon$Df[2],       lrt_chao$Df[2],       lrt_faith$Df[2]),
+  P_value   = c(lrt_shannon$`Pr(>Chisq)`[2],
+                lrt_chao$`Pr(>Chisq)`[2],
+                lrt_faith$`Pr(>Chisq)`[2])
+)
+
+print(alpha_chisq_table)
+
+
+#  Beta Diversity: pseudo-F and P from PERMANOVAs 
+
+# Pull the AL_category row from each PERMANOVA result
+
+beta_permanova_table <- data.frame(
+  Distance_metric = c("Bray-Curtis", "Jaccard",
+                       "Unweighted UniFrac", "Weighted UniFrac"),
+  Variable        = "AL_category",  
+  pseudo_F        = c(permanova_bray$F[1],
+                       permanova_jaccard$F[1],
+                       permanova_unifrac_unweighted$F[1],
+                       permanova_unifrac_weighted$F[1]),
+  R2              = c(permanova_bray$R2[1],
+                       permanova_jaccard$R2[1],
+                       permanova_unifrac_unweighted$R2[1],
+                       permanova_unifrac_weighted$R2[1]),
+  P_value         = c(permanova_bray$`Pr(>F)`[1],
+                       permanova_jaccard$`Pr(>F)`[1],
+                       permanova_unifrac_unweighted$`Pr(>F)`[1],
+                       permanova_unifrac_weighted$`Pr(>F)`[1])
+)
+
+print(beta_permanova_table)
+
+
+# Export both tables 
+
+write.csv(alpha_chisq_table,   "~/Desktop/alpha_diversity_chisq_stats.csv", row.names = FALSE)
+write.csv(beta_permanova_table, "~/Desktop/beta_diversity_pseudoF_stats.csv", row.names = FALSE)
+```
+
