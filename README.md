@@ -1,7 +1,7 @@
 [README.txt](https://github.com/user-attachments/files/25795746/README.txt)
 Read-me file to accompany 'Gut microbiome diversity correlates with reversal learning in hybridizing songbirds' 
 Authors: Austin C. Russell*, Joan C. Spinelli, Noel Martinez, Robert L. Curry, Robin D. Johnsson, Timothy C. Roth II, Georgy A. Semenov, Scott A. Taylor, Amber M. Rice
-*corresponding author: Austin's email address?
+*corresponding author: russella@thomasmore.edu
 
 This read-me file describes the variables contained in each of the data files submitted to accompany this manuscript.
 
